@@ -272,9 +272,37 @@ static int usage(FILE *fp, enum fai_format_options format, int exit_status)
     }
 
     fprintf(fp, "  -h, --help               This message.\n");
-    sam_global_opt_help(fp, "---.-@--");
+    sam_global_opt_help(fp, "---.-@.-");
 
     return exit_status;
+}
+
+/// generate_index - generates index for the given file
+/** @param fn - pointer having the file name
+ *  @param fai_name - pointer to fai index file name
+ *  @param gzi_name - pointer to gzi index file name
+returns 0 on success and 1 on failure
+*/
+int generate_index(const char *fn, const char *fai_name, const char *gzi_name)
+{
+    if (!fn) {
+        fprintf(stderr, "[faidx] Invalid filename argument!\n");
+        return 1;
+    }
+    if (fai_build3(fn, fai_name, gzi_name) != 0) {
+        if (fai_name)
+            fprintf(stderr, "[faidx] Could not build fai index %s", fai_name);
+        else
+            fprintf(stderr, "[faidx] Could not build fai index %s.fai", fn);
+
+        if (gzi_name)
+            fprintf(stderr, " or compressed index %s\n", gzi_name);
+        else
+            fprintf(stderr, "\n");
+
+        return 1;
+    }
+    return 0;
 }
 
 int faidx_core(int argc, char *argv[], enum fai_format_options format)
@@ -393,17 +421,7 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
         if (output_file && !fai_name)
             fai_name = output_file;
 
-        if (fai_build3(argv[optind], fai_name, gzi_name) != 0) {
-            if (fai_name)
-                fprintf(stderr, "[faidx] Could not build fai index %s", fai_name);
-            else
-                fprintf(stderr, "[faidx] Could not build fai index %s.fai", argv[optind]);
-
-            if (gzi_name)
-                fprintf(stderr, " or compressed index %s\n", gzi_name);
-            else
-                fprintf(stderr, "\n");
-
+        if (generate_index(argv[optind], fai_name, gzi_name) != 0) {
             goto exit2;
         }
         exit_status = EXIT_SUCCESS;
@@ -511,6 +529,11 @@ exit1:
             print_error_errno("faidx", "Failed to close output\n");
             exit_status = EXIT_FAILURE;
         }
+    }
+
+    //generate index, if set so and so far successful
+    if (ga.write_index && output_file && exit_status != EXIT_FAILURE) {
+        generate_index(output_file, NULL, NULL);
     }
 
 exit2:

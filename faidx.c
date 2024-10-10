@@ -56,12 +56,29 @@ History:
 #   define ABS(x) ((x)>=0?(x):-(x))
 #endif
 
+/// holds the indexing info for each read name and offsets
+typedef struct idx_t {
+    char *name;                 //name
+    uint64_t seq_offset;        //offset to sequence for given read/reference
+    uint64_t seq_length;        //length of sequence
+    uint64_t qual_offset;       //offset to qualify val for given read
+    uint64_t line_length;       //line length with output is made
+} idx_t;
+
+/// index information about output
+typedef struct idx {
+    int n, m;                       //no of used and max items in index
+    enum fai_format_options format; //fasta or fastq
+    idx_t *indx;                    //array of index info per read
+} idx;
+
 //new params required for output creation
 typedef struct output {
     int isbgzip;                //is bgzip or uncompressed file
     FILE *fp;                   //uncompressed file pointer
     BGZF *bgzf_fp;              //bgzf file pointer
     sam_global_args *gopt;      //options
+    idx *idxdata;               //index information
     kstring_t buffer;
 } output;
 
@@ -108,6 +125,90 @@ static void reverse(char *str, const hts_pos_t len) {
         i++;
         j--;
     }
+}
+
+/// allocidx - allocates required index data buffers
+/** @param in - pointer to idx structure
+ returns NULL on failure
+ returns unmodified input, if required size is already available
+ returns updated input, if reallocation is required
+*/
+static inline idx* allocidx(idx* in)
+{
+    if ((in) && ((in->n + 1) >= in->m)) {                       //+1 to ensure space to save seq offset for next one
+        int newlen = in->m < 1 ? 16 : in->m << 1;               //doubles when reallocation needed
+        idx_t *tmp = realloc(in->indx, newlen * sizeof(idx_t));
+        if (!tmp) {
+            return NULL;
+        }
+        int offset = in->n ? in->n + 1 : 0;
+        int count = newlen - offset;
+        memset(tmp + offset * sizeof(idx_t), 0, count * sizeof(idx_t));
+        in->indx = tmp;
+        in->m = newlen;
+    }
+
+    return in;
+}
+
+/// writeindex - writes index data
+/** @param out - pointer to output structure
+ *  @param output_file - pointer to output file name
+ returns non 0 on failure
+ returns 0 on success
+ seq name and offsets are written on fai index, for both compressed and uncompressed outputs
+ gzi index, dumped through bgzf api, gives the index of plain offsets in compressed file
+*/
+int writeindex(output *out, char *output_file)
+{
+    idx *idxdata = out->idxdata;
+    kstring_t fainame = KS_INITIALIZE, buffer = KS_INITIALIZE;
+    int ret = 0;
+    FILE *fp = NULL;
+
+    ksprintf(&fainame, "%s.fai", output_file);
+
+    if (!(fp = fopen(fainame.s, "w"))) {
+        fprintf(stderr, "[faidx] Failed to create index file for output.\n");
+        ret = 1;
+        goto end;
+    }
+
+    //write fai index data / index on plain - uncompressed data
+    for (int i = 0; i < idxdata->n; ++i) {
+        ks_clear(&buffer);
+        if (idxdata->format == FAI_FASTA) {
+            //name, seq length, offset to sequence, line length, line length + 1 (\n) - it is an existing format!
+            ksprintf(&buffer, "%s\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\n", idxdata->indx[i].name,
+                idxdata->indx[i].seq_length, idxdata->indx[i].seq_offset,
+                idxdata->indx[i].line_length, idxdata->indx[i].line_length + 1);
+        } else {    //FAI_FASTQ
+            //name, seq length, offset to sequence, line length, line length + 1 (\n), offset to quality - it is an existing format!
+            ksprintf(&buffer, "%s\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\n",
+                idxdata->indx[i].name,
+                idxdata->indx[i].seq_length, idxdata->indx[i].seq_offset,
+                idxdata->indx[i].line_length, idxdata->indx[i].line_length + 1,
+                idxdata->indx[i].qual_offset);
+        }
+        if (buffer.l != fwrite(buffer.s, 1, buffer.l, fp)) {
+            fprintf(stderr, "[faidx] Failed to create fai index file for output.\n");
+            ret = 1;
+            goto end;
+        }
+    }
+    //write gzi index data, index on compressed file
+    if (out->isbgzip && bgzf_index_dump(out->bgzf_fp, output_file, ".gzi")) {
+        fprintf(stderr, "[faidx] Failed to create index gzi file for output.\n");
+        ret = 1;
+    }
+end:
+    if (fp) {
+        fclose(fp);
+    }
+    ks_free(&buffer);
+    ks_free(&fainame);
+
+    return ret;
 }
 
 /// wrappedwrite  - wraps the fwrite and bgzf_write
@@ -163,7 +264,7 @@ static int write_output(faidx_t *faid, output *out, const char *name, const int 
                         const char *pos_strand_name, const char *neg_strand_name,
                         enum fai_format_options format) {
     hts_pos_t seq_len, wrap_len = length, len = 0;
-    char *seq =  NULL, *qual = NULL;
+    char *seq =  NULL, *qual = NULL, *tmp = NULL;
     int ret = EXIT_FAILURE;
 
     if (wrap_len < 0)
@@ -175,16 +276,47 @@ static int write_output(faidx_t *faid, output *out, const char *name, const int 
     if (rev && seq_len > 0) {
         reverse_complement(seq, seq_len);
     }
+
+    if (out->gopt->write_index && !allocidx(out->idxdata)) {    //index data allocation
+        fprintf(stderr, "[faidx] Failed to allocate memory for indexing.\n");
+        goto end;
+    }
+
     //write the name
     len = ksprintf(&out->buffer, "%c%s%s\n", format == FAI_FASTA ? '>' : '@', name, rev ? neg_strand_name : pos_strand_name);
     if (wrappedwrite(out, out->buffer.s, out->buffer.l) < len) {
-        fprintf(stderr,"[faidx] Failed to write buffer\n");
-        goto exit;
+        fprintf(stderr,"[faidx] Failed to write buffer.\n");
+        goto end;
     }
+
+    if (out->gopt->write_index) {                                   //index data for current sequence
+        ks_clear(&out->buffer);
+        if (!(tmp = malloc(len - 1))) {
+            fprintf(stderr, "[faidx] Failed to allocate memory.\n");
+            goto end;
+        }
+        strlcpy(tmp, out->buffer.s + 1, len - 1);                   //copy name without start marker and add null
+        out->idxdata->indx[out->idxdata->n].name = tmp;
+        out->idxdata->indx[out->idxdata->n].seq_offset += len;      //last offset + length of name line
+        out->idxdata->indx[out->idxdata->n].seq_length = seq_len;
+    }
+
     ks_clear(&out->buffer);
     //write bases
     if ((ret = write_line(faid, out, seq, name, ignore, wrap_len, seq_len) == EXIT_FAILURE)) {
-        goto exit;
+        goto end;
+    }
+
+    if (out->gopt->write_index) {
+        out->idxdata->indx[out->idxdata->n].line_length = seq_len < wrap_len ? seq_len : wrap_len;
+        if (out->idxdata->format != FAI_FASTA) {                    //fastq, sequence offset + seq len and '\n's
+            out->idxdata->indx[out->idxdata->n].qual_offset = out->idxdata->indx[out->idxdata->n].seq_offset +
+             seq_len + seq_len / wrap_len + ((seq_len % wrap_len) ? 1 : 0);
+        } else {                                                    //fasta, next sequence's temp offset
+            out->idxdata->indx[out->idxdata->n + 1].seq_offset = out->idxdata->indx[out->idxdata->n].seq_offset +
+             seq_len + seq_len / wrap_len + ((seq_len % wrap_len) ? 1 : 0);
+            ++out->idxdata->n;
+        }
     }
 
     if (format == FAI_FASTQ) {
@@ -197,16 +329,24 @@ static int write_output(faidx_t *faid, output *out, const char *name, const int 
         len = ksprintf(&out->buffer, "+\n");
         if (wrappedwrite(out, out->buffer.s, out->buffer.l) < len) {
             fprintf(stderr,"[faidx] Failed to write buffer\n");
-            goto exit;
+            goto end;
         }
         ks_clear(&out->buffer);
         if ((ret = write_line(faid, out, qual, name, ignore, wrap_len, seq_len) == EXIT_FAILURE)) {
-            goto exit;
+            goto end;
+        }
+
+        if (out->gopt->write_index) {
+            out->idxdata->indx[out->idxdata->n].qual_offset += 2;   //fastq, quality offset + '+\n'
+            //next sequence's temp offset - quality offset + qual len + '\n's
+            out->idxdata->indx[out->idxdata->n + 1].seq_offset = out->idxdata->indx[out->idxdata->n].qual_offset +
+             seq_len + seq_len / wrap_len + ((seq_len % wrap_len) ? 1 : 0);
+            ++out->idxdata->n;
         }
     }
     ret = EXIT_SUCCESS;
 
-exit:
+end:
     if (seq) {
         free(seq);
     }
@@ -277,34 +417,6 @@ static int usage(FILE *fp, enum fai_format_options format, int exit_status)
     return exit_status;
 }
 
-/// generate_index - generates index for the given file
-/** @param fn - pointer having the file name
- *  @param fai_name - pointer to fai index file name
- *  @param gzi_name - pointer to gzi index file name
-returns 0 on success and 1 on failure
-*/
-int generate_index(const char *fn, const char *fai_name, const char *gzi_name)
-{
-    if (!fn) {
-        fprintf(stderr, "[faidx] Invalid filename argument!\n");
-        return 1;
-    }
-    if (fai_build3(fn, fai_name, gzi_name) != 0) {
-        if (fai_name)
-            fprintf(stderr, "[faidx] Could not build fai index %s", fai_name);
-        else
-            fprintf(stderr, "[faidx] Could not build fai index %s.fai", fn);
-
-        if (gzi_name)
-            fprintf(stderr, " or compressed index %s\n", gzi_name);
-        else
-            fprintf(stderr, "\n");
-
-        return 1;
-    }
-    return 0;
-}
-
 int faidx_core(int argc, char *argv[], enum fai_format_options format)
 {
     int c, ignore_error = 0, rev = 0;
@@ -318,7 +430,8 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
     char *gzi_name = NULL; // specified compressed index name
     sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
     int exit_status = EXIT_FAILURE, flushed = 0;
-    struct output out = { 0, stdout, NULL, &ga, KS_INITIALIZE}; //data required for output writing
+    idx idxdata = { 0, 0, FAI_FASTA, NULL};
+    struct output out = { 0, stdout, NULL, &ga, &idxdata, KS_INITIALIZE}; //data required for output writing
     faidx_t *fai = NULL;
     hts_tpool *pool = NULL;
 
@@ -421,7 +534,17 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
         if (output_file && !fai_name)
             fai_name = output_file;
 
-        if (generate_index(argv[optind], fai_name, gzi_name) != 0) {
+        if (fai_build3(argv[optind], fai_name, gzi_name) != 0) {
+            if (fai_name)
+                fprintf(stderr, "[faidx] Could not build fai index %s", fai_name);
+            else
+                fprintf(stderr, "[faidx] Could not build fai index %s.fai", argv[optind]);
+
+            if (gzi_name)
+                fprintf(stderr, " or compressed index %s\n", gzi_name);
+            else
+                fprintf(stderr, "\n");
+
             goto exit2;
         }
         exit_status = EXIT_SUCCESS;
@@ -485,6 +608,15 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
             fprintf(stderr,"[faidx] Cannot open \"%s\" for writing :%s.\n", output_file, strerror(errno) );
             goto exit2;
         }
+
+        if (ga.write_index) {
+            out.idxdata->format = format;
+            if(out.isbgzip && bgzf_index_build_init(out.bgzf_fp)) {
+                fprintf(stderr, "[faidx] Failed to setup indexing.\n");
+                goto exit1;
+            }
+        }
+
         if (out.isbgzip && pool) {                              //use thread pool if set
             if (bgzf_thread_pool(out.bgzf_fp, pool, 0)) {
                 fprintf(stderr, "Failed to set thread pool for writing\n");
@@ -522,6 +654,13 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
     }
 
 exit1:
+
+    if(ga.write_index && output_file) {
+        if (writeindex(&out, output_file)) {
+            print_error_errno("faidx", "Failed to create index\n");
+            exit_status = EXIT_FAILURE;
+        }
+    }
     if( output_file != NULL && !out.isbgzip) {
         fclose(out.fp);     //no need to check result as already flushed
     } else if( output_file != NULL && out.isbgzip) {
@@ -529,11 +668,6 @@ exit1:
             print_error_errno("faidx", "Failed to close output\n");
             exit_status = EXIT_FAILURE;
         }
-    }
-
-    //generate index, if set so and so far successful
-    if (ga.write_index && output_file && exit_status != EXIT_FAILURE) {
-        generate_index(output_file, NULL, NULL);
     }
 
 exit2:
@@ -545,6 +679,12 @@ exit2:
     }
     if (pool) {
         hts_tpool_destroy(pool);
+    }
+    if (out.idxdata) {
+        for (int i = 0; i < out.idxdata->n; ++i) {
+            free(out.idxdata->indx[i].name);
+        }
+        free(out.idxdata->indx);
     }
     sam_global_args_free(&ga);
     ks_free(&out.buffer);

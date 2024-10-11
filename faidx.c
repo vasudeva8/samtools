@@ -75,7 +75,6 @@ typedef struct idx {
 //new params required for output creation
 typedef struct output {
     int isbgzip;                //is bgzip or uncompressed file
-    FILE *fp;                   //uncompressed file pointer
     BGZF *bgzf_fp;              //bgzf file pointer
     sam_global_args *gopt;      //options
     idx *idxdata;               //index information
@@ -219,8 +218,7 @@ end:
 */
 static inline size_t wrappedwrite(output *out, const char *buffer, size_t length)
 {
-    return out->isbgzip ? bgzf_write(out->bgzf_fp, buffer, length) :
-        fwrite(buffer, 1, length, out->fp);
+    return bgzf_write(out->bgzf_fp, buffer, length);
 }
 
 static int write_line(faidx_t *faid, output *out, const char *line, const char *name,
@@ -248,8 +246,8 @@ static int write_line(faidx_t *faid, output *out, const char *line, const char *
     for (i = 0; i < seq_sz; i += length)
     {
         hts_pos_t len = i + length < seq_sz ? length : seq_sz - i;
-        if (wrappedwrite(out, line + i, len) < len ||
-              wrappedwrite(out, "\n", 1) < 1) {
+        if (bgzf_write(out->bgzf_fp, line + i, len) < len ||
+              bgzf_write(out->bgzf_fp, "\n", 1) < 1) {
             print_error_errno("faidx", "failed to write output");
             return EXIT_FAILURE;
         }
@@ -284,7 +282,7 @@ static int write_output(faidx_t *faid, output *out, const char *name, const int 
 
     //write the name
     len = ksprintf(&out->buffer, "%c%s%s\n", format == FAI_FASTA ? '>' : '@', name, rev ? neg_strand_name : pos_strand_name);
-    if (wrappedwrite(out, out->buffer.s, out->buffer.l) < len) {
+    if (bgzf_write(out->bgzf_fp, out->buffer.s, out->buffer.l) < len) {
         fprintf(stderr,"[faidx] Failed to write buffer.\n");
         goto end;
     }
@@ -327,7 +325,7 @@ static int write_output(faidx_t *faid, output *out, const char *name, const int 
         }
 
         len = ksprintf(&out->buffer, "+\n");
-        if (wrappedwrite(out, out->buffer.s, out->buffer.l) < len) {
+        if (bgzf_write(out->bgzf_fp, out->buffer.s, out->buffer.l) < len) {
             fprintf(stderr,"[faidx] Failed to write buffer\n");
             goto end;
         }
@@ -429,9 +427,9 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
     char *fai_name = NULL; // specified index name
     char *gzi_name = NULL; // specified compressed index name
     sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
-    int exit_status = EXIT_FAILURE, flushed = 0;
+    int exit_status = EXIT_FAILURE;
     idx idxdata = { 0, 0, FAI_FASTA, NULL};
-    struct output out = { 0, stdout, NULL, &ga, &idxdata, KS_INITIALIZE}; //data required for output writing
+    struct output out = { 0, NULL, &ga, &idxdata, KS_INITIALIZE}; //data required for output writing
     faidx_t *fai = NULL;
     hts_tpool *pool = NULL;
 
@@ -585,11 +583,9 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
             fprintf(stderr,"[faidx] Same input/output : %s\n", output_file);
             goto exit2;
         }
-        if (!out.isbgzip) {
-            out.fp = fopen( output_file, "w" );
-        } else {
+        char mode[13] = "";
+        if (out.isbgzip) {
             hts_opt *opts = (hts_opt *)(out.gopt->out.specific);
-            char mode[13] = "w";
             int level = 4;                                      //default compression level
             while (opts) {
                 if (opts->opt == HTS_OPT_COMPRESSION_LEVEL) {   //compression level
@@ -601,10 +597,12 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
             if (level >= 0) {
                 snprintf(mode, sizeof(mode), "w%d", level);     //pass compression with mode
             }
-            out.bgzf_fp = bgzf_open(output_file, mode);
+        } else {
+            snprintf(mode, sizeof(mode), "wu");                 //uncompressed output
         }
+        out.bgzf_fp = bgzf_open(output_file, mode);
 
-        if( (!out.isbgzip && out.fp == NULL) || (out.isbgzip && out.bgzf_fp == NULL)) {
+        if( out.bgzf_fp == NULL) {
             fprintf(stderr,"[faidx] Cannot open \"%s\" for writing :%s.\n", output_file, strerror(errno) );
             goto exit2;
         }
@@ -617,10 +615,15 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
             }
         }
 
-        if (out.isbgzip && pool) {                              //use thread pool if set
+        if (pool) {                              //use thread pool if set
             if (bgzf_thread_pool(out.bgzf_fp, pool, 0)) {
                 fprintf(stderr, "Failed to set thread pool for writing\n");
             }
+        }
+    } else {
+        if (!(out.bgzf_fp = bgzf_open("-", "wu"))) {
+            fprintf(stderr,"[faidx] Cannot open output for writing :%s.\n", strerror(errno) );
+            goto exit2;
         }
     }
 
@@ -647,8 +650,7 @@ int faidx_core(int argc, char *argv[], enum fai_format_options format)
         exit_status = write_output(fai, &out, argv[optind], ignore_error, line_len, rev, pos_strand_name, neg_strand_name, format);
     }
 
-    flushed = out.isbgzip ? bgzf_flush(out.bgzf_fp) : fflush(out.fp);
-    if (flushed == EOF) {
+    if (bgzf_flush(out.bgzf_fp) == EOF) {
         print_error_errno("faidx", "Failed to flush output\n");
         exit_status = EXIT_FAILURE;
     }
@@ -661,14 +663,10 @@ exit1:
             exit_status = EXIT_FAILURE;
         }
     }
-    if( output_file != NULL && !out.isbgzip) {
-        fclose(out.fp);     //no need to check result as already flushed
-    } else if( output_file != NULL && out.isbgzip) {
         if (bgzf_close(out.bgzf_fp) < 0) {
             print_error_errno("faidx", "Failed to close output\n");
             exit_status = EXIT_FAILURE;
         }
-    }
 
 exit2:
     if (strand_names) {

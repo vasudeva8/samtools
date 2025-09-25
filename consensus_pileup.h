@@ -99,7 +99,7 @@ int pileup_loop(samFile *fp,
                                  samFile *fp,
                                  sam_hdr_t *h,
                                  pileup_t *p),
-                void *client_data);
+                void *client_data, int maxdepth);
 
 
 // A class-like set of data and callback functions

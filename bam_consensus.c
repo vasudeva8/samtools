@@ -221,6 +221,7 @@ typedef struct {
     int low_mqual;
     int high_mqual;
     int min_depth;
+    int max_depth;
     double call_fract;
     double het_fract;
     int mode;   // One of MODE_* macros below
@@ -2186,7 +2187,7 @@ static int basic_pileup(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
                         int depth, hts_pos_t pos, int nth, int is_insert) {
     unsigned char *qp, *cp;
     char *rp;
-    int ref, cb, cq;
+    int ref, cb, cq, i;
     ctx *c = (ctx *)cd;
     consensus_opts *opts = c->opts;
     int tid = p->b.core.tid;
@@ -2272,7 +2273,7 @@ static int basic_pileup(void *cd, samFile *fp, sam_hdr_t *h, pileup_t *p,
     cp = (unsigned char *)ks->s + ks->l;
     ks->l += depth*2 + 2;
     qp = cp+depth+1;
-    for (; p; p = p->next) {
+    for (i = 0; p && i < depth; ++i, p = p->next) {
         // Too tight a loop to help much, but some benefit still
         if (p->next && p->next->next)
             _mm_prefetch(p->next->next, _MM_HINT_T0);
@@ -2469,7 +2470,7 @@ void *pileup_job(void *data) {
     c->iter = sam_itr_queryi(tdata->idx, c->tid, c->start, c->end);
     pileup_loop(fp, c->h, readaln2,
                 opts->mode != MODE_SIMPLE ? nm_init : NULL,
-                c->seq_column, nm_free, c);
+                c->seq_column, nm_free, c, opts->max_depth);
 
     if (opts->fmt == PILEUP && c->last_pos < c->end && opts->all_bases) {
         hts_pos_t beg = MAX(c->iter ?  c->iter->beg : 0, c->last_pos);
@@ -2826,7 +2827,7 @@ int pileup_loop_serial(consensus_opts *opts) {
                         opts->mode != MODE_SIMPLE ? nm_init : NULL,
                         basic_pileup,
                         opts->mode != MODE_SIMPLE ? nm_free : NULL,
-                        &c) < 0)
+                        &c, opts->max_depth) < 0)
             goto err;
 
         if (opts->all_bases) {
@@ -2851,7 +2852,7 @@ int pileup_loop_serial(consensus_opts *opts) {
                         opts->mode != MODE_SIMPLE ? nm_init : NULL,
                         basic_fasta,
                         opts->mode != MODE_SIMPLE ? nm_free : NULL,
-                        &c) < 0)
+                        &c, opts->max_depth) < 0)
             goto err;
 
     next_ref_q:
@@ -2931,6 +2932,7 @@ static void usage_exit(FILE *fp, int exit_status) {
     fprintf(fp, "  --mark-ins            Add '+' before every inserted base/qual [off]\n");
     fprintf(fp, "  -A, --ambig           Enable IUPAC ambiguity codes [off]\n");
     fprintf(fp, "  -d, --min-depth INT   Minimum depth of INT [1]\n");
+    fprintf(fp, "  -D, --max-depth INT   Maximum depth of INT [2147483647]\n");
     fprintf(fp, "  -Z, --block-size INT  Size of chromosome block (bp) when threading [100000]\n");
     fprintf(fp, "      --ref-qual INT    QUAL to use for reference bases [0]\n");
     fprintf(fp, "\nFor simple consensus mode:\n");
@@ -2992,6 +2994,7 @@ int main_consensus(int argc, char **argv) {
         .low_mqual    = 1,
         .high_mqual   = 60,
         .min_depth    = 1,
+        .max_depth    = INT_MAX,
         .call_fract   = 0.75,
         .het_fract    = 0.5,
         .het_only     = 0,
@@ -3038,6 +3041,7 @@ int main_consensus(int argc, char **argv) {
         {"low-MQ"   ,          required_argument, NULL,  9},
         {"high-MQ",            required_argument, NULL, 10},
         {"min-depth",          required_argument, NULL, 'd'},
+        {"max-depth",          required_argument, NULL, 'D'},
         {"call-fract",         required_argument, NULL, 'c'},
         {"het-fract",          required_argument, NULL, 'H'},
         {"region",             required_argument, NULL, 'r'},
@@ -3071,7 +3075,7 @@ int main_consensus(int argc, char **argv) {
         {NULL, 0, NULL, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "@:qd:c:H:r:5f:C:aAl:o:m:pt:X:T:Z:",
+    while ((c = getopt_long(argc, argv, "@:qd:c:H:r:5f:C:aAl:o:m:pt:X:T:Z:D:",
                             lopts, NULL)) >= 0) {
         switch (c) {
         case 'a': opts.all_bases++; break;
@@ -3083,6 +3087,10 @@ int main_consensus(int argc, char **argv) {
         case  9:  opts.low_mqual = atoi(optarg); break;
         case 10:  opts.high_mqual = atoi(optarg); break;
         case 'd': opts.min_depth = atoi(optarg); break;
+        case 'D':
+            if ((opts.max_depth = atoi(optarg)) <= 0)
+                opts.max_depth = INT_MAX;
+            break;
         case 'c': opts.call_fract = atof(optarg); break;
         case 'H': opts.het_fract = atof(optarg); break;
         case 'r': opts.reg = optarg; break;

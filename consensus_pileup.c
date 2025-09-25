@@ -324,7 +324,7 @@ int pileup_loop(samFile *fp,
                                  samFile *fp,
                                  sam_hdr_t *h,
                                  pileup_t *p),
-                void *client_data) {
+                void *client_data, int maxdepth) {
     int ret = -1;
     pileup_t *phead = NULL, *p, *pfree = NULL, *last, *next, *ptail = NULL;
     pileup_t *pnew = NULL;
@@ -383,37 +383,42 @@ int pileup_loop(samFile *fp,
         /* Process data between the last column and our latest addition */
         while (col < pos && phead) {
             struct pileup *eof_head = NULL, *eofp = NULL;
-            int v, ins, depth = 0;
+            int v, ins = 0, depth = 0;
             //printf("Col=%ld pos=%ld nth=%d\n", col, pos, nth);
 
             /* Pileup */
             is_insert = 0;
             pileup_t *pnext = phead ? phead->next : NULL;
             for (p = phead, last = NULL; p; p = pnext) {
-#if 0
-                // Simple prefetching
                 pnext = p->next;
-                if (pnext)
-                    _mm_prefetch(pnext, _MM_HINT_T0);
-#else
-                // More complex prefetching => more instructions, but
-                // usually faster.
-                pnext = p->next;
-                if (pnext) {
-                    // start memory fetches; a big help on very deep data
-                    if (pnext->next)
-                        // struct 2 ahead
-                        _mm_prefetch(pnext->next, _MM_HINT_T0);
-                    // seq/qual 1 ahead
-                    _mm_prefetch(pnext->b_qual + pnext->seq_offset,
-                                 _MM_HINT_T0);
-                    _mm_prefetch(pnext->b_seq  + pnext->seq_offset/2,
-                                 _MM_HINT_T0);
+                if (depth < maxdepth) { //process when not above the required limit
+    #if 0
+                    // Simple prefetching
+                    pnext = p->next;
+                    if (pnext)
+                        _mm_prefetch(pnext, _MM_HINT_T0);
+    #else
+                    // More complex prefetching => more instructions, but
+                    // usually faster.
+                    if (pnext) {
+                        // start memory fetches; a big help on very deep data
+                        if (pnext->next)
+                            // struct 2 ahead
+                            _mm_prefetch(pnext->next, _MM_HINT_T0);
+                        // seq/qual 1 ahead
+                        _mm_prefetch(pnext->b_qual + pnext->seq_offset,
+                                    _MM_HINT_T0);
+                        _mm_prefetch(pnext->b_seq  + pnext->seq_offset/2,
+                                    _MM_HINT_T0);
+                    }
+    #endif
+                    if (!get_next_base(p, col, nth, &ins))
+                        p->eof = 1;
+                    depth++;
+                } else {    //above limit, find whether end or not
+                    if (col >= p->b.core.pos + p->b.core.l_qseq)
+                        p->eof = 1;
                 }
-#endif
-
-                if (!get_next_base(p, col, nth, &ins))
-                    p->eof = 1;
                 if (p->eof == 1) {
                     if (eofp)
                         eofp->eofn = p;
@@ -428,7 +433,6 @@ int pileup_loop(samFile *fp,
                 if (is_insert < ins)
                     is_insert = ins;
 
-                depth++;
             }
             if ((ptail = last) == NULL)
                 ptail = phead;

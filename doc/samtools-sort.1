@@ -3,7 +3,7 @@
 .SH NAME
 samtools sort \- sorts SAM/BAM/CRAM files
 .\"
-.\" Copyright (C) 2008-2011, 2013-2020, 2022-2024 Genome Research Ltd.
+.\" Copyright (C) 2008-2011, 2013-2020, 2022-2025 Genome Research Ltd.
 .\" Portions copyright (C) 2010, 2011 Broad Institute.
 .\"
 .\" Author: Heng Li <lh3@sanger.ac.uk>
@@ -227,6 +227,9 @@ the group order (GO) is
 .BR query ,
 and the sub-sort (SS) is
 .BR template-coordinate .
+.TP
+.BI --set-subsort
+Set subsort order with \fITAG\fP, relevant with \fB-t\fP.
 .PP
 .B Ordering Rules
 
@@ -257,6 +260,12 @@ Character tags (type A) are compared by binary character value.
 .IP \(bu 4
 No attempt is made to compare tags of other types \(em notably type B
 array values will not be compared.
+.PP
+When \fB--set-subsort\fP is in use along with \fB-t\fP, sort order is
+set as \fBunsorted\fP and subsort order is set as \fBunsorted:\fP\fITAG\fP.
+Based on sort options, next level sort added to SS could be one among
+\fBcoordinates\fP, \fBqueryname:natural\fP with \fB-n\fP and
+\fBqueryname:lexicographical\fP with \fB-N\fP.
 .PP
 When the \fB-n\fP or \fB-N\fP option is present, records are sorted by
 name.  Historically samtools has used a \*(lqnatural\*(rq ordering

@@ -166,6 +166,7 @@ typedef enum {Coordinate, QueryName, TagCoordinate, TagQueryName, MinHash, Templ
 static SamOrder g_sam_order = Coordinate;
 static int natural_sort = 1; // not ASCII, but alphanumeric: a12b > a7b
 static char g_sort_tag[2] = {0,0};
+static int g_set_ss = 0;     //existing behaviour, not to set subsort
 
 #define is_digit(c) ((c)<='9' && (c)>='0')
 static int strnum_cmp(const char *_a, const char *_b)
@@ -1610,7 +1611,8 @@ static void merge_usage(FILE *to)
 "  -X         Use customized index files\n"
 "  -L FILE    Specify a BED file for multiple region filtering [null]\n"
 "  --no-PG    do not add a PG line\n"
-"  --template-coordinate Input files are sorted by template-coordinate\n");
+"  --template-coordinate Input files are sorted by template-coordinate\n"
+"  --set-subsort Sets the subsort in header, when used with -t\n");
     sam_global_opt_help(to, "-.O..@..");
 }
 
@@ -3250,6 +3252,7 @@ static int set_sort_order(sam_hdr_t *h, int mapped) {
     const char *new_so = NULL;
     const char *new_go = NULL;
     const char *new_ss = NULL;
+    char sstag[64] = {0};
 
     switch (g_sam_order) {
         case Coordinate:
@@ -3271,7 +3274,18 @@ static int set_sort_order(sam_hdr_t *h, int mapped) {
             break;
         case TagQueryName:
         case TagCoordinate:
-            new_so = "unknown";
+            if (g_set_ss) {     //set unsorted and SS
+                new_so = "unsorted";
+                snprintf(sstag, sizeof(sstag), "unsorted:%c%c:%s",
+                    g_sort_tag[0], g_sort_tag[1],
+                    g_sam_order == TagQueryName ?
+                        natural_sort ?
+                            "queryname:natural" : "queryname:lexicographical" :
+                        "coordinate");
+                new_ss = sstag;
+            } else {            //existing behaviour
+                new_so = "unknown";
+            }
             break;
         case TemplateCoordinate:
             new_so = "unsorted";
@@ -3709,7 +3723,9 @@ static void sort_usage(FILE *fp)
 "      --no-PG\n"
 "               Do not add a PG line\n"
 "      --template-coordinate\n"
-"               Sort by template-coordinate\n");
+"               Sort by template-coordinate\n"
+"      --set-subsort\n"
+"               Sets the subsort in header, when used with -t [0]\n");
     sam_global_opt_help(fp, "-.O..@..");
 }
 
@@ -3735,7 +3751,7 @@ int bam_sort(int argc, char *argv[])
     size_t max_mem = SORT_DEFAULT_MEGS_PER_THREAD << 20;
     int c, nargs, ret, o_seen = 0, level = -1, no_pg = 0;
     SamOrder sam_order = Coordinate;
-    bool by_tag = false;
+    bool by_tag = false, ss = false;
     int minimiser_kmer = 20;
     bool try_rev = true;
     char* sort_tag = NULL, *arg_list = NULL;
@@ -3752,6 +3768,7 @@ int bam_sort(int argc, char *argv[])
         { "threads", required_argument, NULL, '@' },
         {"no-PG", no_argument, NULL, 1},
         { "template-coordinate", no_argument, NULL, 2},
+        { "set-subsort", no_argument, NULL, 3},
         { NULL, 0, NULL, 0 }
     };
 
@@ -3791,6 +3808,9 @@ int bam_sort(int argc, char *argv[])
             else if (minimiser_kmer > 31)
                 minimiser_kmer = 31;
             break;
+        case 3: //set subsort with -t
+            ss = true;
+            break;
 
         default:  if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
                   /* else fall-through */
@@ -3812,6 +3832,9 @@ int bam_sort(int argc, char *argv[])
     // Change sort order if tag sorting is requested.  Must update based on secondary index
     if (by_tag) {
         sam_order = sam_order == QueryName ? TagQueryName : TagCoordinate;
+        if (ss) {
+            g_set_ss = 1;               //use subsort, relevant only with -t
+        }
     }
 
     nargs = argc - optind;

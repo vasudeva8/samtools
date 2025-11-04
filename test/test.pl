@@ -3456,6 +3456,13 @@ sub test_sort
     # Tag sort (FI)
     test_cmd($opts, out=>"sort/tag.fi.sort.expected.sam", ignore_pg_header => 1, cmd=>"$$opts{bin}/samtools sort${threads} -t FI -m 10M $$opts{path}/dat/test_input_1_d.sam -O SAM -o -");
 
+    # Tag sort (RG) with ss
+    test_cmd($opts, out=>"sort/tag.rg.sort.ss.expected.sam", ignore_pg_header => 1, cmd=>"$$opts{bin}/samtools sort${threads} --set-subsort -t RG -m 10M $$opts{path}/dat/test_input_1_a.bam -O SAM -o -");
+
+    # Tag sort (RG); secondary by name; with ss
+    test_cmd($opts, out=>"sort/tag.rg.n.sort.ss.expected.sam", ignore_pg_header => 1, cmd=>"$$opts{bin}/samtools sort${threads} -n --set-subsort -t RG -m 10M $$opts{path}/dat/test_input_1_a.bam -O SAM -o -");
+    test_cmd($opts, out=>"sort/tag.rg.n1.sort.ss.expected.sam", ignore_pg_header => 1, cmd=>"$$opts{bin}/samtools sort${threads} -N --set-subsort -t RG -m 10M $$opts{path}/dat/test_input_1_a.bam -O SAM -o -");
+
     # TemplateCoordinate sort
     test_cmd($opts, out=>"sort/template-coordinate.sort.expected.sam", ignore_pg_header => 1, cmd=>"$$opts{bin}/samtools sort${threads} --template-coordinate -m 10M $$opts{path}/sort/template-coordinate.sort.sam -O SAM -o -");
 

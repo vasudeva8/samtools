@@ -1,6 +1,6 @@
 /*  bam_split.c -- split subcommand.
 
-    Copyright (C) 2013-2016,2018-2019,2023,2024 Genome Research Ltd.
+    Copyright (C) 2013-2016,2018-2019,2023,2024-2025 Genome Research Ltd.
 
     Author: Martin Pollard <mp15@sanger.ac.uk>
 
@@ -75,6 +75,7 @@ struct state {
     kh_c2i_t* tag_val_hash;
     htsThreadPool p;
     int write_index;
+    int sortedbytag;
 };
 
 typedef struct state state_t;
@@ -354,47 +355,67 @@ static int grow_output_lists(state_t *state, size_t count) {
 static khiter_t prep_sam_file(parsed_opts_t *opts, state_t *state,
                               const char *tag, const char *arg_list,
                               int is_rg) {
-    char *input_base_name = NULL, *new_file_name = NULL, *tag_val = NULL;
+    char *input_base_name = NULL, *fn = NULL, *new_file_name = NULL, *tag_val = NULL;
     char *new_idx_fn = NULL;
     sam_hdr_t *new_hdr = NULL;
     samFile *new_sam_file = NULL;
+    int pos = -1, sortedRG = 0;
 
     khiter_t i = kh_get_c2i(state->tag_val_hash, tag);
     if (i != kh_end(state->tag_val_hash)) {
-        return i;
+        /* already in hash, file is open if it is not being split by RG or
+        being split by RG but not sorted - adding new files on the fly */
+        if (!is_rg || !state->sortedbytag) {
+            return i;
+        }
+        sortedRG = 1;
+        // sorted rg split, open file as required in sequence
+        pos = kh_val(state->tag_val_hash, i);
+        if (state->output_file[pos]) { // already opened
+            return i;
+        }
+    } else {
+        // create new file
+        if (grow_output_lists(state, state->output_count + 1) != 0) {
+            print_error_errno("split", "Couldn't grow output lists");
+            return kh_end(state->tag_val_hash);
+        }
     }
-    // create new file
-    if (grow_output_lists(state, state->output_count + 1) != 0) {
-        print_error_errno("split", "Couldn't grow output lists");
-        return kh_end(state->tag_val_hash);
-    }
-    tag_val = strdup(tag);
-    if (!tag_val) {
-        print_error_errno("split", "Couldn't copy tag value");
-        return kh_end(state->tag_val_hash);
-    }
-    char *dirsep = strrchr(opts->merged_input_name, '/');
-    input_base_name = strdup(dirsep? dirsep+1 : opts->merged_input_name);
-    if (!input_base_name) {
-        print_error_errno("split", "Filename parsing failed");
-        goto fail;
-    }
+    if (!sortedRG || i == kh_end(state->tag_val_hash)) {
+        // unsorted or non RG or sorted RG but not present in header
+        tag_val = strdup(tag);
+        if (!tag_val) {
+            print_error_errno("split", "Couldn't copy tag value");
+            return kh_end(state->tag_val_hash);
+        }
+        char *dirsep = strrchr(opts->merged_input_name, '/');
+        input_base_name = strdup(dirsep ? dirsep + 1 : opts->merged_input_name);
+        if (!input_base_name) {
+            print_error_errno("split", "Filename parsing failed");
+            goto fail;
+        }
 
-    char* extension = strrchr(input_base_name, '.');
-    if (extension) *extension = '\0';
+        char *extension = strrchr(input_base_name, '.');
+        if (extension)
+            *extension = '\0';
 
-    new_file_name = expand_format_string(opts->output_format_string,
-                                         input_base_name, tag,
-                                         kh_size(state->tag_val_hash),
-                                         opts->zero_pad, &opts->ga.out);
-    if (!new_file_name) {
-        print_error_errno("split", "Filename creation failed");
-        goto fail;
+        new_file_name = expand_format_string(opts->output_format_string,
+                                             input_base_name, tag,
+                                             kh_size(state->tag_val_hash),
+                                             opts->zero_pad, &opts->ga.out);
+        if (!new_file_name) {
+            print_error_errno("split", "Filename creation failed");
+            goto fail;
+        }
+        fn = new_file_name;
+    } else { // already exists, open file
+        tag_val = state->tag_vals[pos];
+        fn = state->output_file_name[pos];
     }
 
     new_hdr = sam_hdr_dup(state->merged_input_header);
     if (!new_hdr) {
-        print_error_errno("split", "Duplicating header for file \"%s\" failed", new_file_name);
+        print_error_errno("split", "Duplicating header for file \"%s\" failed", fn);
         goto fail;
     }
     if (!opts->no_pg && sam_hdr_add_pg(new_hdr, "samtools",
@@ -402,7 +423,7 @@ static khiter_t prep_sam_file(parsed_opts_t *opts, state_t *state,
                                        arg_list ? "CL": NULL,
                                        arg_list ? arg_list : NULL,
                                        NULL)) {
-        print_error_errno("split", "Adding PG line to file \"%s\" failed", new_file_name);
+        print_error_errno("split", "Adding PG line to file \"%s\" failed", fn);
         goto fail;
     }
 
@@ -412,22 +433,22 @@ static khiter_t prep_sam_file(parsed_opts_t *opts, state_t *state,
         if (sam_hdr_remove_lines(new_hdr, "RG", "ID", NULL) != 0) {
             print_error_errno("split",
                               "Failed to remove @RG lines from file \"%s\"",
-                              new_file_name);
+                              fn);
             goto fail;
         }
         if (sam_hdr_add_line(new_hdr, "RG", "ID", tag_val, NULL) != 0) {
             print_error_errno("split",
                               "Failed to add @RG line to file \"%s\"",
-                              new_file_name);
+                              fn);
             goto fail;
         }
     }
 
     char outmode[4] = "w";
-    sam_open_mode(outmode + 1, new_file_name, NULL);
-    new_sam_file = sam_open_format(new_file_name, outmode, &opts->ga.out);
+    sam_open_mode(outmode + 1, fn, NULL);
+    new_sam_file = sam_open_format(fn, outmode, &opts->ga.out);
     if (!new_sam_file) {
-        print_error_errno("split", "Opening filename for writing \"%s\" failed", new_file_name);
+        print_error_errno("split", "Opening filename for writing \"%s\" failed", fn);
         goto fail;
     }
     if (state->p.pool)
@@ -435,33 +456,41 @@ static khiter_t prep_sam_file(parsed_opts_t *opts, state_t *state,
 
     if (sam_hdr_write(new_sam_file, new_hdr) != 0) {
         print_error_errno("split", "Couldn't write header to \"%s\"",
-                          new_file_name);
+                          fn);
         goto fail;
     }
 
     if (state->write_index) {
-        new_idx_fn = auto_index(new_sam_file, new_file_name, new_hdr);
+        new_idx_fn = auto_index(new_sam_file, fn, new_hdr);
         if (!new_idx_fn) {
-            print_error_errno("split", "Creating index file for file \"%s\" failed", new_file_name);
+            print_error_errno("split", "Creating index file for file \"%s\" failed", fn);
             goto fail;
         }
     }
 
     int ret = -1;
-    i = kh_put_c2i(state->tag_val_hash, tag_val, &ret);
-    if (ret < 0) {
-        print_error_errno("split", "Adding file \"%s\" failed", new_file_name);
-        goto fail;
+    if (pos == -1) {
+        i = kh_put_c2i(state->tag_val_hash, tag_val, &ret);
+        if (ret < 0) {
+            print_error_errno("split", "Adding file \"%s\" failed", fn);
+            goto fail;
+        }
+        kh_val(state->tag_val_hash, i) = state->output_count;
+        state->tag_vals[state->output_count] = tag_val;
+        state->index_file_name[state->output_count] = new_idx_fn;
+        state->output_file_name[state->output_count] = fn;
+        state->output_file[state->output_count] = new_sam_file;
+        state->output_header[state->output_count] = new_hdr;
+        state->output_count++;
+    } else {
+        // udpdate required ones
+        state->index_file_name[pos] = new_idx_fn;
+        state->output_file[pos] = new_sam_file;
+        state->output_header[pos] = new_hdr;
     }
 
-    kh_val(state->tag_val_hash, i) = state->output_count;
-    state->tag_vals[state->output_count] = tag_val;
-    state->index_file_name[state->output_count] = new_idx_fn;
-    state->output_file_name[state->output_count] = new_file_name;
-    state->output_file[state->output_count] = new_sam_file;
-    state->output_header[state->output_count] = new_hdr;
-    state->output_count++;
-    free(input_base_name);
+    if (!sortedRG)
+        free(input_base_name);
     return i;
 
  fail:
@@ -479,6 +508,8 @@ static khiter_t prep_sam_file(parsed_opts_t *opts, state_t *state,
 // Set the initial state
 static state_t* init(parsed_opts_t* opts, const char *arg_list)
 {
+    kstring_t ss = KS_INITIALIZE;
+    char ss_req[32] = {0};
     state_t* retval = calloc(sizeof(state_t), 1);
     if (!retval) {
         print_error_errno("split", "Initialisation failed");
@@ -508,6 +539,16 @@ static state_t* init(parsed_opts_t* opts, const char *arg_list)
         return NULL;
     }
     retval->write_index = opts->ga.write_index;
+    // sorted by required tag? if yes go sequentially else with parallel files
+    snprintf(ss_req, sizeof(ss_req), "unsorted:%s:", opts->tag ? opts->tag : "RG");
+    if (sam_hdr_find_tag_id(retval->merged_input_header, "HD", NULL, NULL, "SS", &ss) ||
+        strstr(ss.s, ss_req) != ss.s) { // failed to get SS or it is not sorted by required tag
+        // consider unsorted, do as it was, open files in parallel
+        retval->sortedbytag = 0;
+    } else {
+        retval->sortedbytag = 1; // sorted by given tag, can do sequentially
+    }
+    ks_free(&ss);
 
     if (opts->unaccounted_name) {
         if (opts->unaccounted_header_name) {
@@ -617,18 +658,34 @@ static state_t* init(parsed_opts_t* opts, const char *arg_list)
         }
 
         retval->output_file_name[i] = output_filename;
-        sam_open_mode(outmode + 1, output_filename, NULL);
-        retval->output_file[i] = sam_open_format(output_filename, outmode, &opts->ga.out);
+        if (!retval->sortedbytag) { // if not sorted, setup all and if sorted do later
+            sam_open_mode(outmode + 1, output_filename, NULL);
+            retval->output_file[i] = sam_open_format(output_filename, outmode, &opts->ga.out);
 
-        if (retval->output_file[i] == NULL) {
-            print_error_errno("split", "Could not open \"%s\"", output_filename);
-            cleanup_state(retval, false);
-            free(input_base_name);
-            return NULL;
+            if (retval->output_file[i] == NULL) {
+                print_error_errno("split", "Could not open \"%s\"", output_filename);
+                cleanup_state(retval, false);
+                free(input_base_name);
+                return NULL;
+            }
+            if (retval->p.pool)
+                hts_set_opt(retval->output_file[i], HTS_OPT_THREAD_POOL, &retval->p);
+
+            // Set and edit header
+            retval->output_header[i] = sam_hdr_dup(retval->merged_input_header);
+            if (sam_hdr_remove_except(retval->output_header[i], "RG", "ID", retval->tag_vals[i]) ||
+                (!opts->no_pg &&
+                 sam_hdr_add_pg(retval->output_header[i], "samtools",
+                                "VN", samtools_version(),
+                                arg_list ? "CL" : NULL,
+                                arg_list ? arg_list : NULL,
+                                NULL))) {
+                print_error("split", "Could not rewrite header for \"%s\"", output_filename);
+                cleanup_state(retval, false);
+                free(input_base_name);
+                return NULL;
+            }
         }
-        if (retval->p.pool)
-            hts_set_opt(retval->output_file[i], HTS_OPT_THREAD_POOL, &retval->p);
-
         // Record index in hash
         int ret;
         khiter_t iter = kh_put_c2i(retval->tag_val_hash, retval->tag_vals[i], &ret);
@@ -638,22 +695,7 @@ static state_t* init(parsed_opts_t* opts, const char *arg_list)
             free(input_base_name);
             return NULL;
         }
-        kh_val(retval->tag_val_hash,iter) = i;
-
-        // Set and edit header
-        retval->output_header[i] = sam_hdr_dup(retval->merged_input_header);
-        if (sam_hdr_remove_except(retval->output_header[i], "RG", "ID", retval->tag_vals[i]) ||
-            (!opts->no_pg &&
-             sam_hdr_add_pg(retval->output_header[i], "samtools",
-                            "VN", samtools_version(),
-                            arg_list ? "CL": NULL,
-                            arg_list ? arg_list : NULL,
-                            NULL))) {
-            print_error("split", "Could not rewrite header for \"%s\"", output_filename);
-            cleanup_state(retval, false);
-            free(input_base_name);
-            return NULL;
-        }
+        kh_val(retval->tag_val_hash, iter) = i;
     }
 
     free(input_base_name);
@@ -664,6 +706,7 @@ static state_t* init(parsed_opts_t* opts, const char *arg_list)
 static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
 {
     int is_rg = !opts->tag || strcmp(opts->tag, "RG") == 0;
+    khiter_t last = kh_end(state->tag_val_hash);
     if (state->unaccounted_file) {
         if (sam_hdr_write(state->unaccounted_file, state->unaccounted_header) != 0) {
             print_error_errno("split", "Could not write output file header");
@@ -694,7 +737,7 @@ static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
         }
     }
 
-    if (is_rg) {
+    if (is_rg && !state->sortedbytag) {
         size_t i;
         for (i = 0; i < state->output_count; i++) {
             if (sam_hdr_write(state->output_file[i], state->output_header[i]) != 0) {
@@ -718,6 +761,7 @@ static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
         char *val = NULL;
         char number[28];
         khiter_t iter;
+        int openfile = 0;
         if (tag) {
             switch (*tag) {
             case 'Z': case 'H':
@@ -739,7 +783,13 @@ static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
         }
         if ( val != NULL ) {
             iter = kh_get_c2i(state->tag_val_hash, val);
-        } else {
+            if (iter != kh_end(state->tag_val_hash) && is_rg && state->sortedbytag) {
+                int pos = kh_val(state->tag_val_hash, iter);
+                if (!state->output_file[pos])
+                    openfile = 1;
+            }
+        }
+        else {
             iter = kh_end(state->tag_val_hash);
         }
 
@@ -747,8 +797,9 @@ static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
         // files if the user specified '-d RG' and we find a RG:Z: value
         // that wasn't listed in the header.  If the '-d' option is
         // not used, we don't open a file to preserve existing behaviour.
-        if (opts->tag && val && iter == kh_end(state->tag_val_hash)
-            && state->output_count < opts->max_split) {
+        if (val && state->output_count < opts->max_split &&
+            ((opts->tag && iter == kh_end(state->tag_val_hash)) ||
+             (is_rg && openfile))) {
             // Need to open a new output file
             iter = prep_sam_file(opts, state, val, arg_list, is_rg);
             if (iter == kh_end(state->tag_val_hash)) { // Open failed
@@ -762,8 +813,30 @@ static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
 
         // Write the read out to correct file
         if (iter != kh_end(state->tag_val_hash)) {
+            int i = -1;
+            if (state->sortedbytag && iter != last && last != kh_end(state->tag_val_hash)) {
+                // close prev file as it is not required anymore
+                i = kh_val(state->tag_val_hash, last);
+                if (state->write_index) {
+                    if (sam_idx_save(state->output_file[i]) < 0) {
+                        print_error_errno("split", "writing index \"%s\" failed",
+                                          state->index_file_name[i]);
+                        return false;
+                    }
+                }
+                // keeps tag vals as it is key to hash
+                free(state->output_file_name[i]);
+                state->output_file_name[i] = NULL;
+                free(state->index_file_name[i]);
+                state->index_file_name[i] = NULL;
+                sam_hdr_destroy(state->output_header[i]);
+                state->output_header[i] = NULL;
+                sam_close(state->output_file[i]);
+                state->output_file[i] = NULL;
+            }
+            last = iter;
             // if found write to the appropriate untangled bam
-            int i = kh_val(state->tag_val_hash,iter);
+            i = kh_val(state->tag_val_hash, iter);
             if (sam_write1(state->output_file[i], state->output_header[i], file_read) < 0) {
                 print_error_errno("split", "Could not write to \"%s\"", state->output_file_name[i]);
                 goto error;
@@ -801,7 +874,7 @@ static bool split(state_t* state, parsed_opts_t *opts, char *arg_list)
     if (state->write_index) {
         size_t i;
         for (i = 0; i < state->output_count; i++) {
-            if (sam_idx_save(state->output_file[i]) < 0) {
+            if (state->output_file[i] && sam_idx_save(state->output_file[i]) < 0) {
                 print_error_errno("split", "writing index \"%s\" failed",
                                   state->index_file_name[i]);
                 return false;

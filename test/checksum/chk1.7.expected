@@ -1,8 +1,8 @@
 ###	set	count		b_seq	name_b_seq	b_seq_qual	b_seq_tags(BC,FI,QT,RT,TC)
-all	all	144		12eebb31	7e82e134	156fc353	12eebb31
-all	pass	144		12eebb31	7e82e134	156fc353	12eebb31
-	all	0		1	1	1	1
-	pass	0		1	1	1	1
+all	all	288		7ec98147	2bf6a3c2	18989a96	7ec98147
+all	pass	288		7ec98147	2bf6a3c2	18989a96	7ec98147
+	all	144		12eebb31	7e82e134	156fc353	12eebb31
+	pass	144		12eebb31	7e82e134	156fc353	12eebb31
 ERR013140	all	71		2259e00a	338c6a3	7621d262	2259e00a
 ERR013140	pass	71		2259e00a	338c6a3	7621d262	2259e00a
 ERR016352	all	13		425c725f	5708826e	f45a8e2	425c725f

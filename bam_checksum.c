@@ -528,7 +528,7 @@ static int key_qsort(const void *t1, const void *t2) {
 }
 
 // Compatibility with biobambam2's bamseqchksum output format
-int checksum_bamseqchksum(opts *o, sums_t *all, sums_t *noRG, khash_t(chk) *h, int rghdr){
+int checksum_bamseqchksum(opts *o, sums_t *all, sums_t *noRG, khash_t(chk) *h){
     // Why two tabs after count?
     fprintf(o->fp, "###\tset\tcount\t\tb_seq\tname_b_seq\tb_seq_qual\tb_seq_tags(BC,FI,QT,RT,TC)\n");
 
@@ -537,9 +537,7 @@ int checksum_bamseqchksum(opts *o, sums_t *all, sums_t *noRG, khash_t(chk) *h, i
     o->verbose = 1;
     o->show_combine = 0;
     sums_report(o, all,  "all");
-    //add noRG if RG hdr or RG data exists; bambam does it only if it is in hdr
-    if (rghdr || kh_size(h))
-        sums_report(o, noRG,  "");
+    sums_report(o, noRG,  "");
 
     // Per read-group line
     int nrgs = 0;
@@ -562,9 +560,9 @@ int checksum_bamseqchksum(opts *o, sums_t *all, sums_t *noRG, khash_t(chk) *h, i
 }
 
 int checksum_report(char *fn, opts *o,
-                    sums_t *all, sums_t *noRG, khash_t(chk) *h, int rghdr) {
+                    sums_t *all, sums_t *noRG, khash_t(chk) *h) {
     if (o->compat)
-        return checksum_bamseqchksum(o, all, noRG, h, rghdr);
+        return checksum_bamseqchksum(o, all, noRG, h);
 
     // headers
     fprintf(o->fp, "# Checksum 1.0 for file:%s%s\n",
@@ -629,7 +627,6 @@ int checksum(sam_global_args *ga, opts *o, char *fn) {
     khash_t(chk) *h = kh_init(chk);
     int ret = -1;
     int64_t nrec = o->nrec;
-    kstring_t rgline = KS_INITIALIZE;
 
     if (!b || !tag_ptr || !tag_len || !h)
         goto err;
@@ -670,8 +667,6 @@ int checksum(sam_global_args *ga, opts *o, char *fn) {
 
     if (!(hdr = sam_hdr_read(fp)))
         goto err;
-
-    sam_hdr_find_line_id(hdr, "RG", NULL, NULL, &rgline);   //chk for RG hdr
 
     int r;
     while ((r = sam_read1(fp, hdr, b)) >= 0) {
@@ -802,7 +797,7 @@ int checksum(sam_global_args *ga, opts *o, char *fn) {
     fp = NULL;
 
     // Report hashes
-    if (checksum_report(fn, o, &h32, &noRG, h, rgline.l > 0) < 0)
+    if (checksum_report(fn, o, &h32, &noRG, h) < 0)
         goto err;
 
     ret = 0;
@@ -829,7 +824,6 @@ int checksum(sam_global_args *ga, opts *o, char *fn) {
         }
         kh_destroy(chk, h);
     }
-    ks_free(&rgline);
     return ret;
 }
 
@@ -1140,7 +1134,7 @@ int combine(opts *o, int argc, char **argv) {
             goto err;
         }
     }
-    checksum_report("merge", o, &s, &noRG, h, 0);
+    checksum_report("merge", o, &s, &noRG, h);
 
     ret = 0;
  err:
